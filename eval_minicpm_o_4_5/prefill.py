@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# KHS: builds the assistant history the model is told it already produced.
+# khs_claude_code: builds the assistant history the model is told it already produced.
 #
 # The default protocol plays the finished mix at the model and lets it listen. The
 # moderator's earlier turns arrive on the input channel, so the model hears its own past
@@ -41,15 +41,27 @@ TAIL_SEC = 6.0             # matches make_probe_audio.py
 
 # ------------------------------------------------------------------ user audio
 def build_user_track(root, timeline, probe, sr, exclude=("MOD",)):
-    """The input channel with the moderator removed.
+    """The input channel with the moderator removed, at the official mix level.
 
-    Rebuilt from the isolated turn files rather than by subtracting from the mix, since
-    the turns overlap on purpose and there is nothing to subtract. Debater turns are
-    summed at their own start times, so a crossfire interruption still overlaps.
+    khs_claude_code: this reproduces make_probe_audio.py rather than approximating it,
+    because the prefill arm is compared against the probe wav that script writes and any
+    difference is confounded with the thing being measured.
 
-    The leak handling of make_probe_audio.py is kept: for an event or content probe the
-    turn after the answer is silenced for the length of the window, because a next
-    speaker starting is itself the answer.
+      level      the official mix is exactly 0.5 times the sum of the isolated turns
+                 (measured: rms_sum / rms_mix = 2.0000 on five debates), so summing at
+                 unity would drive the model with a signal 6 dB hotter than the baseline
+                 arm, straight into the speak or listen gate.
+
+      the answer the official script zeroes the answer turn's TIME SPAN in the mix, which
+                 also removes whatever other speaker overlaps it. Dropping only that
+                 turn's file leaves the overlapping debater audible: on 48 of 143 probes
+                 somebody else is speaking inside that span, and on 25 of them the
+                 official file's hard cut lands inside the scoring window. The floor
+                 going quiet is the one acoustic cue the timing metric rests on.
+
+      the next   for an event or content probe the turn after the answer is silenced for
+                 the length of the window, because a next speaker starting is itself the
+                 answer.
     """
     import librosa
     win_e = (probe["t_latest"] if probe["t_latest"] is not None
@@ -58,13 +70,7 @@ def build_user_track(root, timeline, probe, sr, exclude=("MOD",)):
     track = np.zeros(int(end * sr) + 1, dtype=np.float32)
     turns = {t["i"]: t for t in timeline["turns"]}
     for t in timeline["turns"]:
-        # KHS: the answer turn goes whatever speaker holds it. make_probe_audio.py
-        # silences tl[before_turn] unconditionally, and on this data every negative
-        # probe's before_turn is a debater, not the moderator. Removing only moderator
-        # audio would leave the debater talking straight through the decision point,
-        # which is itself the cue that nobody intervened, and would make all 66 silence
-        # probes trivially easy.
-        if t["i"] == probe["before_turn"] or t["speaker"] in exclude or t["start_sec"] >= end:
+        if t["speaker"] in exclude or t["start_sec"] >= end:
             continue
         p = root / "audio/turns" / f'{timeline["debate_id"]}_{t["i"]:03d}.mp3'
         if not p.exists():
@@ -74,14 +80,22 @@ def build_user_track(root, timeline, probe, sr, exclude=("MOD",)):
         j = min(len(track), i + len(a))
         if j > i:
             track[i:j] += a[: j - i].astype(np.float32)
+    track *= 0.5                                   # the official mix level
+
+    def silence(t0, t1):
+        i, j = int(max(0.0, t0) * sr), int(min(t1, end) * sr)
+        if j > i:
+            track[i:j] = 0.0
+
+    gt = turns.get(probe["before_turn"])
+    if gt:
+        silence(gt["start_sec"], gt["end_sec"])    # the answer, span not turn
     if probe.get("kind") in ("event", "content"):
         nxt = turns.get(probe["before_turn"] + 1)
         if nxt:
-            i, j = int(nxt["start_sec"] * sr), int(min(win_e, end) * sr)
-            if j > i:
-                track[i:j] = 0.0
+            silence(nxt["start_sec"], win_e)
     peak = float(np.abs(track).max())
-    if peak > 1.0:                       # summing turns can clip
+    if peak > 1.0:
         track /= peak
     return track[: int(end * sr)]
 
@@ -137,19 +151,25 @@ def build_schedule(history, tokenizer, ids, chunk_seconds=1.0,
             while room < len(toks):
                 c += 1
                 room = max_tokens - 3 - len(buckets.get(c, []))
-            if c in owner and owner[c] != turn["turn"]:
-                raise ValueError(f"turn {turn['turn']} lands in chunk {c}, already held "
-                                 f"by turn {owner[c]}. Two utterances would fuse.")
+            # khs_claude_code: two moderator turns can land in the same chunk. Raising
+            # there aborted the run on 18 of the 143 probes. The later turn is pushed
+            # right instead, which costs it a chunk of alignment and is visible in the
+            # span rather than fatal.
+            while c in owner and owner[c] != turn["turn"]:
+                c += 1
             owner[c] = turn["turn"]
             buckets.setdefault(c, []).extend(toks)
             touched.append(c)
         if not touched:
             continue
-        lo, hi = min(touched), max(touched)
+        # khs_claude_code: a word placed in chunk c is heard from chunk c + lookahead,
+        # so the span has to reach that far or the tail of the last word of every
+        # prefilled turn is cut. The Raon side carries the same correction.
+        lo, hi = min(touched), max(touched) + lookahead_chunks
         spans.append({"turn": turn["turn"], "start_chunk": lo, "end_chunk": hi,
                       "start_sec": round(lo * chunk_seconds, 3),
                       "end_sec": round((hi + 1) * chunk_seconds, 3),
-                      "text": turn["text"], "last_chunk": hi})
+                      "text": turn["text"], "last_chunk": max(touched)})
 
     last_chunks = {s["last_chunk"] for s in spans}
     sched = {}
@@ -159,9 +179,24 @@ def build_schedule(history, tokenizer, ids, chunk_seconds=1.0,
             seq.append(ids["turn_eos"])
         seq.append(ids["chunk_eos"])
         sched[c] = seq
+
+    # khs_claude_code: a pause inside an utterance is NOT a listen chunk. The official
+    # loop rewrites a listen token to tts_bos while a turn is open, tts_bos is not a
+    # chunk terminator, and the queue is then empty, so the sampler runs free and the
+    # model invents words and audio into the middle of the moderator's own history. On
+    # this data four of the five debate openers contain such a pause, which put invented
+    # speech inside the forced history of 52 probes. A silent chunk inside a span is
+    # speak followed immediately by chunk_eos: the utterance stays open and nothing is
+    # sampled. Only the gaps BETWEEN turns are real listening.
+    inside = set()
+    for sp in spans:
+        inside |= set(range(sp["start_chunk"], sp["end_chunk"] + 1))
     release = (max(sched) + 1) if sched else 0
     for c in range(release):
-        sched.setdefault(c, [ids["listen"]])
+        if c in sched:
+            continue
+        sched[c] = ([ids["speak"], ids["chunk_eos"]] if c in inside
+                    else [ids["listen"]])
     return sched, spans, release
 
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# khs_claude_code: new file - conda env step for this evaluation.
 # Create a dedicated conda environment for MiniCPM-o 4.5.
 #
 # It is a NEW environment. Nothing installs into an environment that already
@@ -33,7 +34,7 @@ echo "[setup] installing the official pinned stack"
   "torchaudio<=2.8.0" \
   "minicpmo-utils[all]>=1.0.5"
 
-# KHS: setuptools is not incidental. librosa still imports pkg_resources, which a
+# khs_claude_code: setuptools is not incidental. librosa still imports pkg_resources, which a
 # bare conda python no longer ships, and the failure surfaces far from the cause:
 # transformers reports the model file as requiring librosa, which is installed.
 echo "[setup] installing what the probe driver needs on top of the official stack"

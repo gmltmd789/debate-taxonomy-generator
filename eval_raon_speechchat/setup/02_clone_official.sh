@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# khs_claude_code: new file - clone official step for this evaluation.
 # Clone the official Raon-Speech repository at a pinned commit.
 #
 # Reference material. The duplex API this branch drives, RaonPipeline.duplex,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# KHS: word level alignment of every moderator turn, cached once and reused.
+# khs_claude_code: word level alignment of every moderator turn, cached once and reused.
 #
 # This is the input to the prefill schedule. To place a moderator turn into the
 # assistant channel as if the model had produced it, we need to know when each word is
@@ -23,8 +23,9 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from probe_data import ProbeSet, find_data_sample                  # noqa: E402
 
-DEFAULT_ALIGNER = ("/gpfs/home1/gmltmd7/workspace/Cowork/samsung_mx/debate5min/"
-                   "models/Qwen3-ForcedAligner-0.6B")
+# khs_claude_code: a repo id by default so this folder is self contained. Point
+# --aligner at a local directory to run offline.
+DEFAULT_ALIGNER = "Qwen/Qwen3-ForcedAligner-0.6B"
 
 
 def main():
@@ -94,6 +95,19 @@ def main():
 
     p = pathlib.Path(args.out)
     p.parent.mkdir(parents=True, exist_ok=True)
+    # khs_claude_code: merge rather than replace. The shipped asset holds all 97 turns,
+    # --out defaults to it, and the usage line shows --debates, so writing only what this
+    # invocation produced would replace the asset with one debate and make every other
+    # probe raise the missing alignment error, which itself tells the reader to run this
+    # command again.
+    if p.exists():
+        try:
+            kept = json.load(open(p)).get("turns", {})
+            kept.update(out)
+            print(f"[align] merged into {len(kept)} turns already in {p}")
+            out = kept
+        except (json.JSONDecodeError, OSError):
+            pass
     json.dump({"aligner": args.aligner, "speakers": args.speakers,
                "note": "word times are relative to the start of the turn audio, and "
                        "start_sec puts the turn on the debate timeline",

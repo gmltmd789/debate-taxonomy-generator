@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# KHS: a short smoke check. It loads the pipeline, runs one duplex pass on a few seconds
+# khs_claude_code: a short smoke check. It loads the pipeline, runs one duplex pass on a few seconds
 # of silence and prints what it saw. It is here to catch an install that does not work
 # and to measure the speed before a long run, not to certify anything.
 #

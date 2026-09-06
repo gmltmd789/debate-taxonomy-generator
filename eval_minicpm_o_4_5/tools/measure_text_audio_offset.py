@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# KHS: measures which chunk a word's text is emitted in against the chunk its audio
+# khs_claude_code: measures which chunk a word's text is emitted in against the chunk its audio
 # actually starts in.
 #
 # Why this exists. MiniCPM-o 4.5 places text with TAIL, Time Aligned Interleaving. The
@@ -89,11 +89,14 @@ def main():
     for r in rows_in:
         wav, sr = sf.read(str(run / r["wav"]), dtype="float32")
         chunk_s = r["chunk_seconds"]
-        cursor = 0
         for si, seg in enumerate(r["segments"]):
             n = sum(k for _, k in seg.get("audio_chunks", []))
-            a = wav[cursor: cursor + n]
-            cursor += n
+            # khs_claude_code: the segment records where its audio starts in the file.
+            # Walking a cursor from zero over the free segments only aligns every word
+            # against the wrong audio on a prefilled run, where the file opens with the
+            # forced history.
+            off = int(seg.get("audio_offset", 0))
+            a = wav[off: off + n]
             words = words_from_chunks(seg.get("text_chunks", []))
             if len(words) < args.min_words:
                 skipped["too short"] += 1

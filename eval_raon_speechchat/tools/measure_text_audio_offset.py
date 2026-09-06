@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# KHS: measures how far ahead of its own speech the model emits text.
+# khs_claude_code: measures how far ahead of its own speech the model emits text.
 #
 # Why this exists. The technical report says Raon-SpeechChat is trained with "one-frame
 # text lookahead ... so that speech semantic tokens are predicted conditioned on text

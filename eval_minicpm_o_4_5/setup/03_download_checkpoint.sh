@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# khs_claude_code: new file - download checkpoint step for this evaluation.
 # Download the official MiniCPM-o 4.5 checkpoint at a pinned revision.
 #
 # About 20 GB over 54 files. It includes assets/token2wav, which holds the
@@ -22,7 +23,7 @@ DEST="$CKPT_ROOT/MiniCPM-o-4_5"
 PY="$CONDA/envs/$ENV_NAME/bin/python"
 [ -x "$PY" ] || { echo "[setup] no interpreter at $PY. Run 01_conda_env.sh first."; exit 1; }
 
-# KHS: the version bound is not cosmetic. transformers pins huggingface_hub below
+# khs_claude_code: the version bound is not cosmetic. transformers pins huggingface_hub below
 # 1.0, and installing the cli extra with --upgrade pulls 1.x and breaks every
 # transformers import in the environment. Install inside the bound instead.
 "$PY" -m pip install --quiet "huggingface_hub[cli]>=0.34.0,<1.0"

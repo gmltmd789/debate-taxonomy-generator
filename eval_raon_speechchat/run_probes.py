@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# KHS: drives the official Raon-SpeechChat duplex path over a debate probe set.
+# khs_claude_code: drives the official Raon-SpeechChat duplex path over a debate probe set.
 #
 # The official code is called and not modified. RaonPipeline.duplex already accepts a
 # system prompt and a speaker reference wav, so the driver passes those and leaves every
@@ -28,7 +28,7 @@ import re
 import sys
 import time
 
-# KHS: the official duplex loop prints a tqdm bar for every frame, which is thousands of
+# khs_claude_code: the official duplex loop prints a tqdm bar for every frame, which is thousands of
 # lines per probe in a log file. tqdm reads this at construction, so it is set before the
 # pipeline is imported; our own progress bar passes disable=False to opt back in.
 os.environ.setdefault("TQDM_DISABLE", "1")
@@ -42,7 +42,7 @@ FRAME_LINE = re.compile(
     r"^\[(?P<phase>\w+)\] f=(?P<f>\d+) text=(?P<text>.*?) "
     r"out_rms=(?P<out>[\d.eE+-]+) in_rms=(?P<in>[\d.eE+-]+) ntok=(?P<ntok>\d+)\s*$")
 
-# KHS: Raon has an explicit backchannel state, and the token shows up in the frame log
+# khs_claude_code: Raon has an explicit backchannel state, and the token shows up in the frame log
 # text. A backchannel is "mm-hmm" while somebody else holds the floor. It is not a
 # moderator intervention, and counting it as one would make every probe look like the
 # model spoke. Segments carrying it are flagged and left out of the onset search, and
@@ -117,7 +117,10 @@ def install_prefill_hook(model):
     def wrapped(new_logits, **kw):
         f = ctl["frame"]
         ctl["frame"] = f + 1
-        forcing = ctl["schedule"] is not None and f < ctl["release"]
+        # khs_claude_code: frame minus one is the call init_duplex_decoding_state makes
+        # for the official forced first prediction. Overwriting it with SIL made
+        # --speak-first a silent no op while run_config still recorded it as set.
+        forcing = ctl["schedule"] is not None and 0 <= f < ctl["release"]
         if forcing:
             token = ctl["schedule"].get(f, prefill.SIL_ID)
             forced = torch.full_like(new_logits, -1e9)
@@ -127,7 +130,7 @@ def install_prefill_hook(model):
         codes = ctl.get("codes")
         if forcing and codes is not None:
             row = codes.get(f)
-            # KHS: audio_codes grows by one row on a speaking frame, and that row is
+            # khs_claude_code: audio_codes grows by one row on a speaking frame, and that row is
             # both what the decoder speaks and what the next step conditions on. When
             # the real moderator audio has codes for this frame, they replace the ones
             # the model just invented, so the history is the original recording rather
@@ -263,11 +266,12 @@ def prepare_prefill(pipe, item, args, probe_dir, ctl):
     wav = probe_dir / "user_input.wav"
     sf.write(str(wav), track, sr)
 
-    # KHS: init_duplex_decoding_state calls the wrapped function once, for the forced
+    # khs_claude_code: init_duplex_decoding_state calls the wrapped function once, for the forced
     # first prediction, before the frame loop starts. Counting from zero would put every
     # scheduled frame one frame early, which was verified against the frame log: a
     # schedule with EPAD at frame 2 landed at log frame 1. Starting at minus one lines
     # the counter up with the log.
+    prefill.adopt_token_ids(pipe.model)     # khs_claude_code: ids from the checkpoint
     ctl["schedule"], ctl["release"], ctl["frame"] = sched, release, -1
     ctl["codes"] = None
     if args.force_audio_codes:
@@ -289,12 +293,12 @@ def run_one(pipe, item, args, out_dir, sampling, ctl=None):
         audio_path, info = prepare_prefill(pipe, item, args, probe_dir, ctl)
 
     kwargs = dict(sampling)
-    kwargs["system_prompt"] = item["system_prompt"]        # KHS: benchmark prompt
+    kwargs["system_prompt"] = item["system_prompt"]        # khs_claude_code: benchmark prompt
     if item["reference_wav"] is not None:
         kwargs["speaker_audio"] = str(item["reference_wav"])
 
     frame_rate = float(pipe.processor.frame_rate)
-    # KHS: forcing the text does not guarantee the acoustic side follows. On this model
+    # khs_claude_code: forcing the text does not guarantee the acoustic side follows. On this model
     # the same forced turn came out 11 percent voiced on one draw and 93 percent on
     # another, with the audio collapsing partway through and never recovering. A history
     # the model can read but not hear is not the experiment, so a draw below min_voiced
@@ -323,19 +327,26 @@ def run_one(pipe, item, args, out_dir, sampling, ctl=None):
         # about 14 MB per probe and not needed for scoring
         (probe_dir / "user_assistant.wav").unlink(missing_ok=True)
 
-    # KHS: every field below describes what the MODEL did. Segments we forced are not
+    # khs_claude_code: every field below describes what the MODEL did. Segments we forced are not
     # the model's choices, so they are split out rather than counted: without this
     # spoke is True and spoke_at is 0.08 on every probe in prefill mode, which is the
     # forced onset and says nothing.
+    # khs_claude_code: split on the frame the segment STARTS on against the release
+    # frame, not on a time that can fall inside a segment. And a backchannel is not an
+    # intervention, which this file says in its own header: counting one made spoke true
+    # with text null on probes where an mm-hmm under a debater is the expected duplex
+    # behaviour, so the same row disagreed with itself.
+    rel_frame = info["release_frame"] if info else 0
     rel = info["release_sec"] if info else 0.0
-    forced = [g for g in parsed["segments"] if g["start"] < rel]
-    free = [g for g in parsed["segments"] if g["start"] >= rel]
+    forced = [g for g in parsed["segments"] if g["start_frame"] < rel_frame]
+    after = [g for g in parsed["segments"] if g["start_frame"] >= rel_frame]
+    free = [g for g in after if args.count_backchannels or not g["is_backchannel"]]
     said = " ".join(g["text"] for g in free if g["text"]) or None
-    audible = next((g["start"] for g in free if not g["is_backchannel"]), None)
+    audible = free[0]["start"] if free else None
 
     return {"probe_id": item["probe_id"], "debate_id": item["debate_id"],
             "model": "Raon-SpeechChat-9B",
-            # KHS: both models clone the moderator voice zero shot, so which clip did it
+            # khs_claude_code: both models clone the moderator voice zero shot, so which clip did it
             # belongs in the result rather than only in the run config
             "voice_id": item["voice_id"],
             "ref_wav": str(item["reference_wav"]) if item["reference_wav"] else None,
@@ -345,6 +356,7 @@ def run_one(pipe, item, args, out_dir, sampling, ctl=None):
             "text": said,
             "segments": free, "n_segments": len(free),
             "prefilled_segments": forced,
+            "backchannel_segments": [g for g in after if g["is_backchannel"]],
             "speech_frames": parsed["speech_frames"],
             **window_view(free, item, args.count_backchannels),
             "prefill": info,
@@ -494,7 +506,7 @@ def main():
     print(f"[run] loading {args.ckpt}")
     from transformers.dynamic_module_utils import get_class_from_dynamic_module
     RaonPipeline = get_class_from_dynamic_module("modeling_raon.RaonPipeline", args.ckpt)
-    widen_decoder_timeout(RaonPipeline, args.decoder_timeout)   # KHS, see the function
+    widen_decoder_timeout(RaonPipeline, args.decoder_timeout)   # khs_claude_code, see the function
     pipe = RaonPipeline(args.ckpt, device="cuda", dtype=args.dtype,
                         attn_implementation=args.attn)
     print(f"[run] pipeline ready, {pipe.processor.frame_rate} frames per second, "

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# KHS: reads a probe set and produces exactly what a model runner needs for one probe.
+# khs_claude_code: reads a probe set and produces exactly what a model runner needs for one probe.
 # Nothing here is model specific, so both evaluation branches carry the same file.
 #
 # Every path is an argument with a sensible default rather than a fixed location, so a

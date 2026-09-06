@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# KHS: a short smoke check. It loads the model, runs a few duplex chunks on silence and
+# khs_claude_code: a short smoke check. It loads the model, runs a few duplex chunks on silence and
 # prints what it saw. It is here to catch an install that does not work and to measure
 # the per chunk cost before a long run, not to certify anything.
 #

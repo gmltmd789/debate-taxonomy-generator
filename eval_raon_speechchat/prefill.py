@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# KHS: builds the assistant history the model is told it already produced.
+# khs_claude_code: builds the assistant history the model is told it already produced.
 #
 # The default protocol plays the finished mix at the model and lets it listen. The
 # moderator's earlier turns arrive on the input channel, so the model hears its own past
@@ -35,11 +35,24 @@ import pathlib
 
 import numpy as np
 
-# from the released checkpoint's special tokens
+# the released checkpoint's special tokens. These are the values in this revision's
+# config, and adopt_token_ids replaces them with whatever the loaded model reports, so a
+# checkpoint that renumbers them cannot silently degrade the forcing into uniform
+# sampling among the tokens the grammar mask happens to allow.
 SIL_ID = 151672
 BC_ID = 151673
 PAD_ID = 151677
 EPAD_ID = 151678
+
+
+def adopt_token_ids(model):
+    """Take the duplex token ids from the loaded checkpoint."""
+    global SIL_ID, BC_ID, PAD_ID, EPAD_ID
+    SIL_ID = int(getattr(model, "duplex_sil_token_id", SIL_ID))
+    BC_ID = int(getattr(model, "duplex_bc_token_id", BC_ID))
+    PAD_ID = int(getattr(model, "duplex_pad_token_id", PAD_ID))
+    EPAD_ID = int(getattr(model, "duplex_end_pad_token_id", EPAD_ID))
+    return {"SIL": SIL_ID, "BC": BC_ID, "PAD": PAD_ID, "EPAD": EPAD_ID}
 
 LOOKAHEAD_FRAMES = 3       # measured, see tools/measure_text_audio_offset.py
 TAIL_SEC = 6.0             # matches make_probe_audio.py
@@ -47,15 +60,27 @@ TAIL_SEC = 6.0             # matches make_probe_audio.py
 
 # ------------------------------------------------------------------ user audio
 def build_user_track(root, timeline, probe, sr, exclude=("MOD",)):
-    """The input channel with the moderator removed.
+    """The input channel with the moderator removed, at the official mix level.
 
-    Rebuilt from the isolated turn files rather than by subtracting from the mix, since
-    the turns overlap on purpose and there is nothing to subtract. Debater turns are
-    summed at their own start times, so a crossfire interruption still overlaps.
+    khs_claude_code: this reproduces make_probe_audio.py rather than approximating it,
+    because the prefill arm is compared against the probe wav that script writes and any
+    difference is confounded with the thing being measured.
 
-    The leak handling of make_probe_audio.py is kept: for an event or content probe the
-    turn after the answer is silenced for the length of the window, because a next
-    speaker starting is itself the answer.
+      level      the official mix is exactly 0.5 times the sum of the isolated turns
+                 (measured: rms_sum / rms_mix = 2.0000 on five debates), so summing at
+                 unity would drive the model with a signal 6 dB hotter than the baseline
+                 arm, straight into the speak or listen gate.
+
+      the answer the official script zeroes the answer turn's TIME SPAN in the mix, which
+                 also removes whatever other speaker overlaps it. Dropping only that
+                 turn's file leaves the overlapping debater audible: on 48 of 143 probes
+                 somebody else is speaking inside that span, and on 25 of them the
+                 official file's hard cut lands inside the scoring window. The floor
+                 going quiet is the one acoustic cue the timing metric rests on.
+
+      the next   for an event or content probe the turn after the answer is silenced for
+                 the length of the window, because a next speaker starting is itself the
+                 answer.
     """
     import librosa
     win_e = (probe["t_latest"] if probe["t_latest"] is not None
@@ -64,13 +89,7 @@ def build_user_track(root, timeline, probe, sr, exclude=("MOD",)):
     track = np.zeros(int(end * sr) + 1, dtype=np.float32)
     turns = {t["i"]: t for t in timeline["turns"]}
     for t in timeline["turns"]:
-        # KHS: the answer turn goes whatever speaker holds it. make_probe_audio.py
-        # silences tl[before_turn] unconditionally, and on this data every negative
-        # probe's before_turn is a debater, not the moderator. Removing only moderator
-        # audio would leave the debater talking straight through the decision point,
-        # which is itself the cue that nobody intervened, and would make all 66 silence
-        # probes trivially easy.
-        if t["i"] == probe["before_turn"] or t["speaker"] in exclude or t["start_sec"] >= end:
+        if t["speaker"] in exclude or t["start_sec"] >= end:
             continue
         p = root / "audio/turns" / f'{timeline["debate_id"]}_{t["i"]:03d}.mp3'
         if not p.exists():
@@ -80,14 +99,22 @@ def build_user_track(root, timeline, probe, sr, exclude=("MOD",)):
         j = min(len(track), i + len(a))
         if j > i:
             track[i:j] += a[: j - i].astype(np.float32)
+    track *= 0.5                                   # the official mix level
+
+    def silence(t0, t1):
+        i, j = int(max(0.0, t0) * sr), int(min(t1, end) * sr)
+        if j > i:
+            track[i:j] = 0.0
+
+    gt = turns.get(probe["before_turn"])
+    if gt:
+        silence(gt["start_sec"], gt["end_sec"])    # the answer, span not turn
     if probe.get("kind") in ("event", "content"):
         nxt = turns.get(probe["before_turn"] + 1)
         if nxt:
-            i, j = int(nxt["start_sec"] * sr), int(min(win_e, end) * sr)
-            if j > i:
-                track[i:j] = 0.0
+            silence(nxt["start_sec"], win_e)
     peak = float(np.abs(track).max())
-    if peak > 1.0:                       # summing turns can clip
+    if peak > 1.0:
         track /= peak
     return track[: int(end * sr)]
 
@@ -156,7 +183,7 @@ def build_schedule(history, tokenizer, frame_rate=12.5,
                 first = f
         if first is None:
             continue
-        # KHS: the lookahead is the offset of the TEXT token. The speaking phase has to
+        # khs_claude_code: the lookahead is the offset of the TEXT token. The speaking phase has to
         # last until the AUDIO finishes, so the end is not shifted. Subtracting the
         # lookahead here would drop to SIL about 240 ms early and cut the tail off the
         # last word of every prefilled turn.
@@ -179,16 +206,22 @@ def build_schedule(history, tokenizer, frame_rate=12.5,
         for f in sorted(text_frames):
             if f - 1 in text_frames or local.get(f - 1) == EPAD_ID:
                 continue
-            if local.get(f - 1) == PAD_ID:
-                local[f - 1] = EPAD_ID
-            else:
-                local[f - 1] = EPAD_ID          # start of turn, already free
+            local[f - 1] = EPAD_ID
 
-        clash = [f for f in local if f in sched]
-        if clash:
-            raise ValueError(f"turn {turn['turn']} overlaps an earlier prefilled turn at "
-                             f"frames {sorted(clash)[:5]}. Two utterances would fuse "
-                             f"into one with no silence between them.")
+        # khs_claude_code: two moderator turns can sit a fifth of a second apart, and the
+        # three frame lookahead then pulls the later turn's onset onto the earlier one's
+        # last PAD. Raising there aborted the run on 18 of the 143 probes. Pushing the
+        # later turn far enough right to leave one silent frame between them keeps the
+        # grammar valid and costs a few frames of alignment on the turns that collide,
+        # which is recorded as shift_frames rather than hidden.
+        if sched:
+            need = max(sched) + 2 - (first - 1)     # one SIL frame, then the onset
+            if need > 0:
+                local = {f + need: t for f, t in local.items()}
+                text_frames = {f + need for f in text_frames}
+                first += need
+                end_frame += need
+                shift += need
         for f, t in local.items():
             sched[f] = t
         spans.append({"turn": turn["turn"], "start_frame": first - 1,
@@ -211,6 +244,14 @@ def encode_turn_codes(model, wav_path, sample_rate, num_code_groups):
     """
     import librosa
     import torch
+    # khs_claude_code: forcing a single code row per frame is only correct while the
+    # semantic and acoustic codebooks share a frame. A checkpoint with a non zero
+    # acoustic delay would split them and every forced frame would be wrong with no
+    # visible symptom, so the assumption is pinned rather than left implicit.
+    if int(getattr(model, "max_delay", 0)) != 0:
+        raise NotImplementedError(
+            f"this checkpoint has acoustic delay {model.max_delay}; forcing audio codes "
+            f"one row per frame assumes no delay")
     wav, _ = librosa.load(str(wav_path), sr=sample_rate, mono=True)
     a = torch.tensor(wav, dtype=torch.float32, device=model.device)[None, None]
     lengths = torch.tensor([a.shape[-1]], device=model.device)
@@ -236,11 +277,25 @@ def build_code_schedule(model, root, history, spans, frame_rate, sample_rate,
             continue
         codes = encode_turn_codes(model, root / turn["audio"], sample_rate,
                                   num_code_groups)
-        a0 = int(round(turn["start_sec"] * frame_rate)) + sp["shift_frames"]
+        # khs_claude_code: minus one because the pipeline hands back the PREVIOUS frame's
+        # audio. init_duplex_decoding_state pushes a row without pulling, and every step
+        # then pushes one and pulls the oldest, so a code written at hook frame f is
+        # heard at wav frame f + 1. Cross correlating a prefilled run against the source
+        # recording peaked at exactly +1 frame before this correction.
+        a0 = int(round(turn["start_sec"] * frame_rate)) + sp["shift_frames"] - 1
         for t in range(codes.shape[0]):
             f = a0 + t
             if sp["start_frame"] <= f <= sp["end_frame"]:
                 sched[f] = codes[t]
+        # khs_claude_code: the span opens a few frames before the recording starts,
+        # because the text runs ahead of its audio, and closes a frame or two after it
+        # ends. Those frames would otherwise carry codes the model invented, so the
+        # onset of every prefilled turn would not be the original recording, and the
+        # near silence there would drag the voiced fraction down and trigger redraws.
+        # They are filled with the tokenizer's own silence instead.
+        silence = model.get_silence_codes(codes.device)
+        for f in range(sp["start_frame"], sp["end_frame"] + 1):
+            sched.setdefault(f, silence)
     return sched
 
 

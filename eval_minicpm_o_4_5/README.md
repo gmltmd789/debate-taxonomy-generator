@@ -245,12 +245,20 @@ before the model is touched and refuses to run a schedule that breaks it.
 
 ### What the prefilled history is, exactly
 
-Only the text side is forced. The schedule says which word the model said on which
+Only the text side is forced here. The schedule says which word the model said in which
 chunk, and the model generates the speech for those words itself, conditioned on the
-moderator's reference clip. So the history is the right words at the right times in the
-right voice, re synthesised rather than the original recording. Forcing the original
-audio as well would mean encoding it with the model's own audio tokenizer and overriding
-the code generation, which is a deeper change than this branch makes.
+moderator's reference clip, so the history is the right words at the right times in the
+right voice, re synthesised rather than the original recording.
+
+The Raon branch forces the audio codes as well, because its acoustic side did not
+reliably follow the forced text. This one's does: every forced span measured so far came
+out fully voiced, so there is nothing here for that change to fix, and its speech units
+live in a different space that would need its own encoder path.
+
+The Raon branch forces the audio codes as well, because its acoustic side did not
+reliably follow the forced text. This one's does: every forced span measured so far came
+out fully voiced, so there is nothing here for that change to fix, and the speech units
+live in a different space that would need its own encoder path.
 
 ### The forced history has to be heard, not just written
 
@@ -264,14 +272,14 @@ the experiment.
 So the forced span is measured from the decoder's own output level and reported:
 
 ```json
-"prefill": {"release_sec": 18.48, "turns_prefilled": 1,
-            "voiced_overall": 0.93, "voiced_ok": true, "attempts": 2,
-            "per_turn": [{"turn": 0, "frames": 232, "voiced": 0.93}]}
+"prefill": {"release_sec": 18.0, "release_chunk": 18, "turns_prefilled": 1,
+            "voiced_overall": 1.0, "voiced_ok": true,
+            "per_span": [{"start": 1.0, "samples": 408960, "voiced": 1.0}]}
 ```
 
-A draw below `--min-voiced` is discarded and redrawn, up to `--prefill-retries`. A probe
-that never clears the bar is kept with `voiced_ok` false rather than silently counted,
-so a run can be filtered on it.
+There is no redraw here, unlike the Raon branch: this model's forced spans have not been
+seen to fall short, so a draw is measured and recorded rather than repeated. `voiced_ok`
+is what a run should be filtered on.
 
 ### The row describes the model, not what we forced
 
@@ -286,6 +294,13 @@ Everything after the last prefilled chunk is the model's own.
 |---|---|---|
 | `--prefill` | off | path to the alignments, `assets/alignments.json` when bare |
 | `--lookahead-chunks` | `1` | measured; how many chunks before its audio a word's text is placed |
+| `--min-voiced` | `0.5` | least of the forced history that must come out as sound |
+
+`--stop-at-onset`, `--no-reference` and any `--chunk-seconds` other than `1.0` are
+rejected when combined with `--prefill` or outright, because each of them produces a
+full results file that reads like a model result: breaking at the first forced chunk,
+dropping the speech decoder's prompt so nothing decodes, and buffering audio the duplex
+grid cannot take.
 
 ## What a code review caught, after this was first pushed
 
@@ -371,7 +386,7 @@ speech only, so `init_vision=False` and `frame_list` is empty.
 `debates.jsonl`.
 
 **Stopping at the first spoken chunk.** What is measured is settled the moment
-`is_listen` turns false, so continuing would only cost time. `--run-to-end` keeps going.
+`is_listen` turns false, so nothing after the utterance is measured.
 
 ## Choices worth arguing with
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# KHS: drives the official MiniCPM-o 4.5 duplex loop over a debate probe set.
+# khs_claude_code: drives the official MiniCPM-o 4.5 duplex loop over a debate probe set.
 #
 # The official loop is copied from the repository README, section "Duplex Omni Mode",
 # and kept in the same shape: prepare once, then per chunk call streaming_prefill
@@ -119,9 +119,18 @@ def install_prefill_hook(duplex):
 
     def wrapped(logits=None, **kw):
         q = ctl["queue"]
-        if q:
-            return torch.tensor([q.pop(0)], dtype=torch.long,
-                                device=logits.device if logits is not None else "cuda")
+        if q and logits is not None:
+            # khs_claude_code: mask the logits and let the official decode run, rather
+            # than returning a token in its place. decode is the only writer of the
+            # repetition penalty history, so short circuiting it left that history empty
+            # across the whole forced prefix: at the release point the decoder believed
+            # it had said nothing, and the model re announced the debate format it had
+            # just been told it already announced. That artefact belongs to the hook,
+            # not the model, and it is absent from the control this run is compared to.
+            token = q.pop(0)
+            forced = torch.full_like(logits, -1e9)
+            forced[..., token] = 0.0
+            return original(logits=forced, **kw)
         return original(logits=logits, **kw)
 
     duplex.decoder.decode = wrapped
@@ -139,11 +148,22 @@ def build_model(args):
     model = AutoModel.from_pretrained(
         str(args.ckpt), trust_remote_code=True, attn_implementation=args.attn,
         torch_dtype=getattr(torch, args.dtype),
-        init_vision=args.with_vision,     # KHS: speech only benchmark, no video stream
+        init_vision=args.with_vision,     # khs_claude_code: speech only benchmark, no video stream
         init_audio=True, init_tts=True)
     model.eval().cuda()
-    model.init_tts()
+    # khs_claude_code: as_duplex calls init_tts itself, so calling it here as well loads
+    # the token to waveform stack twice. The official README example does not call it.
     return model.as_duplex()
+
+
+def _voiced_fraction(a, sr, window_ms=80.0, floor=0.001):
+    """Fraction of short windows in a waveform that carry sound."""
+    n = max(1, int(sr * window_ms / 1000))
+    m = len(a) // n
+    if m == 0:
+        return 0.0
+    rms = np.sqrt((a[: m * n].astype(np.float64).reshape(m, n) ** 2).mean(axis=1))
+    return round(float((rms >= floor).mean()), 3)
 
 
 def window_view(segments, item, release_sec=0.0):
@@ -217,10 +237,19 @@ def run_one(model, item, args, out_dir, gen, ctl=None):
     chunks = to_chunks(wav, args.chunk_seconds)
 
     ref_path = str(item["reference_wav"]) if item["reference_wav"] else None
-    prepare_kwargs = {"prefix_system_prompt": item["system_prompt"]}   # KHS: benchmark prompt
+    prepare_kwargs = {"prefix_system_prompt": item["system_prompt"]}   # khs_claude_code: benchmark prompt
     if ref_path:
         prepare_kwargs["ref_audio"] = load_audio(ref_path)
         prepare_kwargs["prompt_wav_path"] = ref_path
+    # khs_claude_code: prepare resets the decoder and the streaming processor but not
+    # the audio encoder's key value cache, which self clears only after about 29 s of
+    # audio. Without this the opening chunks of one probe are encoded with the tail of
+    # the previous one still in attention, and the same probe answers differently
+    # depending on what ran before it. reset_token2wav_cache stays off so the voice lives.
+    try:
+        model.model.reset_session(reset_token2wav_cache=False)
+    except TypeError:
+        model.model.reset_session()
     model.prepare(**prepare_kwargs)
 
     segments, cur, speech = [], None, []
@@ -231,8 +260,16 @@ def run_one(model, item, args, out_dir, gen, ctl=None):
             # an empty queue hands the decision back
             ctl["queue"] = (list(sched.get(idx, [ids["listen"]]))
                             if idx < release else None)
-        model.streaming_prefill(audio_waveform=chunk, frame_list=[],   # KHS: no video
-                                max_slice_nums=1, batch_vision_feed=False)
+        pre = model.streaming_prefill(audio_waveform=chunk, frame_list=[],
+                                      max_slice_nums=1, batch_vision_feed=False)
+        # khs_claude_code: streaming_prefill returns success False when it buffered the
+        # audio instead of consuming it, and streaming_generate then early returns
+        # is_listen True without touching the queue. Scoring that as a listening decision
+        # would drop a schedule entry and shift every later timestamp.
+        if isinstance(pre, dict) and pre.get("success") is False:
+            raise RuntimeError(
+                f"streaming_prefill did not consume chunk {idx}: {pre.get('msg')}. "
+                f"The duplex grid is fixed at one second.")
         r = model.streaming_generate(prompt_wav_path=ref_path, **gen)
         listening = r.get("is_listen", True)
         if listening:
@@ -250,13 +287,13 @@ def run_one(model, item, args, out_dir, gen, ctl=None):
         cur["end"] = round((idx + 2) * args.chunk_seconds, 3)
         if r.get("text"):
             cur["text"] += r["text"]
-            # KHS: which chunk emitted which text, the other half of what the offset
+            # khs_claude_code: which chunk emitted which text, the other half of what the offset
             # measurement needs. TAIL assigns a text token to the chunk its start time
             # falls in, so recovering that mapping needs the chunk recorded per piece.
             cur.setdefault("text_chunks", []).append([idx, r["text"]])
         if r.get("audio_waveform") is not None:
             a = np.asarray(r["audio_waveform"], dtype=np.float32)
-            # KHS: which chunk produced which samples. Without this the saved wav is a
+            # khs_claude_code: which chunk produced which samples. Without this the saved wav is a
             # concatenation with no timeline, and the offset between a word's text and
             # the audio that speaks it cannot be measured afterwards.
             cur.setdefault("audio_chunks", []).append([idx, len(a)])
@@ -279,7 +316,7 @@ def run_one(model, item, args, out_dir, gen, ctl=None):
 
     merged = np.concatenate(speech) if speech else None
     if info is not None:
-        # KHS: forcing the text does not guarantee the acoustic side follows, so the
+        # khs_claude_code: forcing the text does not guarantee the acoustic side follows, so the
         # forced span is measured rather than assumed. A run where this is low has a
         # history the model can read but not hear, which is not the experiment.
         cursor, per_turn = 0, []
@@ -289,12 +326,19 @@ def run_one(model, item, args, out_dir, gen, ctl=None):
             cursor += n
             if seg["start"] >= info["release_sec"]:
                 continue
-            rms = float(np.sqrt((a.astype(np.float64) ** 2).mean())) if len(a) else 0.0
+            # khs_claude_code: the fraction of short windows that carry sound, not one
+            # root mean square over the whole span thresholded to a bool. A span that
+            # speaks for two seconds then collapses for sixteen scores far above any
+            # sensible floor on the whole span measure, which is the case this is for.
             per_turn.append({"start": seg["start"], "samples": int(n),
-                             "rms": round(rms, 5), "voiced": bool(rms >= 0.001)})
+                             "voiced": _voiced_fraction(a, args.output_sample_rate)})
         info["per_span"] = per_turn
-        info["voiced_overall"] = (round(sum(x["voiced"] for x in per_turn) / len(per_turn), 3)
-                                  if per_turn else None)
+        tot = sum(x["samples"] for x in per_turn)
+        info["voiced_overall"] = (
+            round(sum(x["voiced"] * x["samples"] for x in per_turn) / tot, 3)
+            if tot else None)
+        info["min_voiced"] = args.min_voiced
+        info["voiced_ok"] = bool((info["voiced_overall"] or 0.0) >= args.min_voiced)
         info["min_voiced"] = args.min_voiced
         info["voiced_ok"] = bool((info["voiced_overall"] or 0.0) >= args.min_voiced)
     audible_at = None
@@ -302,16 +346,21 @@ def run_one(model, item, args, out_dir, gen, ctl=None):
         audible_at = round(segments[0]["start"]
                            + first_sound_offset(merged, args.output_sample_rate), 3)
 
-    # KHS: every field below describes what the MODEL did. Chunks we forced are not the
+    # khs_claude_code: every field below describes what the MODEL did. Chunks we forced are not the
     # model's choices, so they are split out rather than counted: without this spoke is
     # True on every probe in prefill mode and spoke_at is the forced onset.
+    # khs_claude_code: split on the chunk the segment STARTS in against the release
+    # chunk. A time boundary falling inside a segment claimed the last forced chunk as an
+    # intervention on seven probes, and filed a genuine immediate intervention as prefill
+    # whenever the model spoke straight through the release.
+    rel_chunk = info["release_chunk"] if info else -1
     rel = info["release_sec"] if info else 0.0
-    forced = [g for g in segments if g["start"] < rel]
-    free = [g for g in segments if g["start"] >= rel]
+    forced = [g for g in segments if g["start_chunk"] < rel_chunk]
+    free = [g for g in segments if g["start_chunk"] >= rel_chunk]
 
     row = {"probe_id": item["probe_id"], "debate_id": item["debate_id"],
            "model": "MiniCPM-o-4_5",
-           # KHS: both models clone the moderator voice zero shot, so which clip did it
+           # khs_claude_code: both models clone the moderator voice zero shot, so which clip did it
            # belongs in the result rather than only in the run config
            "voice_id": item["voice_id"],
            "ref_wav": str(item["reference_wav"]) if item["reference_wav"] else None,
@@ -420,6 +469,20 @@ def parse_args():
 
 def main():
     args = parse_args()
+    # khs_claude_code: these combinations do not fail, they write a full results file
+    # that reads like a model result. Rejecting them is the only honest option.
+    if args.prefill and args.stop_at_onset:
+        sys.exit("[run] --stop-at-onset with --prefill breaks at the first FORCED chunk, "
+                 "so every probe would report spoke false. Drop one of them.")
+    if args.chunk_seconds != 1.0:
+        sys.exit(f"[run] --chunk-seconds {args.chunk_seconds}: the duplex grid is fixed "
+                 f"at one second in the released model, so any other value silently "
+                 f"drops or buffers audio.")
+    if args.no_reference:
+        sys.exit("[run] --no-reference also drops prompt_wav_path, which the speech "
+                 "decoder needs: every chunk would decode to nothing and the run would "
+                 "write a results file with no audio at all.")
+
     out_dir = pathlib.Path(args.out) / args.tag
     out_dir.mkdir(parents=True, exist_ok=True)
     results = out_dir / ("results.jsonl" if args.num_shards == 1

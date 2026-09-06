@@ -264,12 +264,15 @@ SIL SIL ... SIL   EPAD w1 PAD PAD   EPAD w2 PAD   EPAD w3 ...   SIL SIL
 
 ### What the prefilled history is, exactly
 
-Only the text side is forced. The schedule says which word the model said on which
-frame, and the model generates the speech for those words itself, conditioned on the
-moderator's reference clip. So the history is the right words at the right times in the
-right voice, re synthesised rather than the original recording. Forcing the original
-audio as well would mean encoding it with the model's own audio tokenizer and overriding
-the code generation, which is a deeper change than this branch makes.
+Both the text and the audio are forced. The schedule says which word the model said on
+which frame, and the moderator's real recording is encoded with the model's own audio
+tokenizer so the codes it "produced" are the original waveform, not a re synthesis.
+
+Forcing only the text was tried first and is still available as `--no-force-audio-codes`.
+It leaves the acoustic side to the model, and the model does not reliably follow: over
+six draws of one eighteen second turn the forced span came out 11 to 94 percent voiced,
+median 43, collapsing partway through and never recovering. With the codes forced the
+first draw was 89 percent, the remainder being the pauses in the recording itself.
 
 ### The forced history has to be heard, not just written
 
@@ -305,6 +308,9 @@ Everything after the last prefilled frame is the model's own.
 |---|---|---|
 | `--prefill` | off | path to the alignments, `assets/alignments.json` when bare |
 | `--lookahead-frames` | `3` | measured; `1` reproduces the paper's training stage number |
+| `--force-audio-codes` | on | force the real recording's audio codes as well as the text |
+| `--min-voiced` | `0.5` | least of the forced history that must come out as sound |
+| `--prefill-retries` | `2` | redraws allowed before a probe is kept with `voiced_ok` false |
 
 ## What a code review caught, after this was first pushed
 

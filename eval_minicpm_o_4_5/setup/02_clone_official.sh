@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# khs_claude_code: new file - clone official step for this evaluation.
 # Clone the official MiniCPM-o repository at a pinned commit.
 #
 # The repository is reference material: the README it carries is the source of
